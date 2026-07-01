@@ -154,10 +154,27 @@ app.post('/webhooks/twitch', express.raw({ type: 'application/json' }), async (r
     const match = rewardTitle.match(/risxcoins[:\s]*(\d+)/i);
     if (match) {
       const twitchPoints = parseInt(match[1]);
-      const coinsToAdd   = Math.floor(twitchPoints / 1000) * 10;
+      let coinsToAdd = Math.floor(twitchPoints / 1000) * 10;
 
       if (coinsToAdd > 0) {
         try {
+          // Comprobar si el viewer es suscriptor del canal
+          let isSub = false;
+          try {
+            const appTok = await getTwitchAppToken();
+            const subRes = await axios.get('https://api.twitch.tv/helix/subscriptions/user', {
+              params: { broadcaster_id: event.broadcaster_user_id, user_id: twitchUserId },
+              headers: { 'Authorization': `Bearer ${appTok}`, 'Client-Id': TWITCH_CLIENT_ID }
+            });
+            isSub = subRes.data.data && subRes.data.data.length > 0;
+          } catch { isSub = false; }
+
+          // Aplicar bonus x1.5 si es suscriptor
+          if (isSub) {
+            coinsToAdd = Math.floor(coinsToAdd * 1.5);
+            console.log(`⭐ ${twitchLogin} es suscriptor — bonus x1.5 aplicado`);
+          }
+
           // Buscar usuario por twitch_id en Firebase
           const user = await fsQueryByField('users', 'twitch_id', twitchUserId);
 
@@ -171,10 +188,11 @@ app.post('/webhooks/twitch', express.raw({ type: 'application/json' }), async (r
                 type: 'earn',
                 amount: coinsToAdd,
                 twitchPoints,
-                description: `Canje automático: ${twitchPoints.toLocaleString()} puntos del canal`,
+                isSub,
+                description: `Canje automatico${isSub ? ' BONUS SUB x1.5' : ''}: ${twitchPoints.toLocaleString()} puntos del canal`,
                 createdAt: new Date().toISOString()
               });
-              console.log(`✅ +${coinsToAdd} RisxCoins para ${twitchLogin} (${newCoins} total)`);
+              console.log(`+${coinsToAdd} RisxCoins para ${twitchLogin}${isSub ? ' (sub bonus)' : ''} (${newCoins} total)`);
             } else {
               console.log(`⚠️ Canje ${redemptionId} ya procesado`);
             }
@@ -273,4 +291,77 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 RisxCoins server on port ${PORT}`);
   console.log(`📡 Webhook: ${PUBLIC_URL}/webhooks/twitch`);
+});
+
+// ─── TWITCH CHAT BOT ──────────────────────────────────────────
+let chatToken = null;
+let chatRefreshToken = process.env.CHAT_REFRESH_TOKEN || null;
+
+async function getChatToken() {
+  if (chatToken) return chatToken;
+  if (!chatRefreshToken) return null;
+  try {
+    const r = await axios.post('https://id.twitch.tv/oauth2/token', null, {
+      params: {
+        client_id: TWITCH_CLIENT_ID,
+        client_secret: TWITCH_CLIENT_SECRET,
+        grant_type: 'refresh_token',
+        refresh_token: chatRefreshToken
+      }
+    });
+    chatToken = r.data.access_token;
+    chatRefreshToken = r.data.refresh_token;
+    setTimeout(() => { chatToken = null; }, (r.data.expires_in - 60) * 1000);
+    return chatToken;
+  } catch (e) {
+    console.error('Error refreshing chat token:', e.message);
+    return null;
+  }
+}
+
+async function sendChatMessage(message) {
+  try {
+    const token = await getChatToken();
+    if (!token) return;
+    const userRes = await axios.get('https://api.twitch.tv/helix/users', {
+      params: { login: 'risx00' },
+      headers: { 'Authorization': `Bearer ${token}`, 'Client-Id': TWITCH_CLIENT_ID }
+    });
+    const broadcasterId = userRes.data.data[0].id;
+    await axios.post('https://api.twitch.tv/helix/chat/messages', {
+      broadcaster_id: broadcasterId,
+      sender_id: broadcasterId,
+      message
+    }, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Client-Id': TWITCH_CLIENT_ID,
+        'Content-Type': 'application/json'
+      }
+    });
+    console.log(`💬 Chat: ${message}`);
+  } catch (e) {
+    console.error('Error chat:', e.response?.data || e.message);
+  }
+}
+
+app.get('/setup-chat', async (req, res) => {
+  const { secret, code } = req.query;
+  if (secret !== process.env.ADMIN_SECRET) return res.status(403).json({ error: 'No autorizado' });
+  try {
+    const r = await axios.post('https://id.twitch.tv/oauth2/token', null, {
+      params: {
+        client_id: TWITCH_CLIENT_ID,
+        client_secret: TWITCH_CLIENT_SECRET,
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri: 'https://localhost'
+      }
+    });
+    chatToken = r.data.access_token;
+    chatRefreshToken = r.data.refresh_token;
+    res.json({ ok: true, refresh_token: chatRefreshToken });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data || e.message });
+  }
 });
